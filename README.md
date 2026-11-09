@@ -164,6 +164,16 @@ Remove any special character from your filename and from the directories that co
 
 Make sure your Blender is in English, do not used a translated interface (sorry).
 
+### Tiles pile onto one spot, or the texture looks like shattered glass
+
+Symptoms of the "draped" vertex shader Google Maps switched to in 2026: every
+tile lands in the same place, or each tile is enormous, or the city is
+recognisable but every triangle is displaced as though its texture came from
+somewhere else. All four causes are fixed in this fork; if you see them again
+after another shader change, [doc/Draped shader (2026).md](doc/Draped%20shader%20(2026).md)
+records what the shader does and how to check a reading of the data against
+the capture's own framebuffer rather than guessing.
+
 Frequently Asked Questions
 --------------------------
 

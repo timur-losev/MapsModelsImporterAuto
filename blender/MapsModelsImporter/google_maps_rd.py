@@ -95,6 +95,26 @@ def hasPositionAndUV(attributes):
     counts = [count for _, count in attributes]
     return len(counts) >= 2 and any(c >= 3 for c in counts) and any(c == 2 for c in counts)
 
+def findUvAttribute(attrs, capture_type):
+    """Which vertex attribute carries the texture coordinates.
+
+    A fixed index used to do: the UV sat at attribute 1 for Google Maps and 2
+    for Google Earth. The current Maps shader puts 8-bit normals at 1 and the
+    UV at 2, and reading the normals as a UV destroys the texturing while
+    still looking almost plausible. Texture coordinates are the only
+    2-component attribute, so find them by shape instead. Attribute 0 is the
+    position and is never the UV.
+    """
+    for index, attr in enumerate(attrs):
+        if index == 0:
+            continue
+        fmt = getattr(attr, "format", None)
+        if getattr(fmt, "compCount", None) == 2:
+            print(f"UV found at vertex attribute {index} (the 2-component one)")
+            return index
+    # No 2-component attribute: fall back to what the old code assumed.
+    return 2 if capture_type == "Google Earth" else 1
+
 def numpySave(array, file):
     np.array([array.ndim], dtype=np.int32).tofile(file)
     np.array(array.shape, dtype=np.int32).tofile(file)
@@ -107,6 +127,9 @@ class CaptureScraper():
         self.controller = controller
         self._uniform_names_cache = {}
         self._signature_cache = {}
+        # Resolved once from the first drawcall's vertex layout, then reused:
+        # every tile in a capture goes through the same shader.
+        self.uv_index = None
         # Names the structural strategy worked out, handed to the importer so
         # that it knows which constant is the matrix and which the UV
         # transform when it cannot recognise them by name.
@@ -523,7 +546,9 @@ class CaptureScraper():
                     numpySave(unpacked, file)
 
                 # UV
-                uv_index = 2 if capture_type == "Google Earth" else 1
+                if self.uv_index is None:
+                    self.uv_index = findUvAttribute(attrs, capture_type)
+                uv_index = self.uv_index
                 if len(meshes) <= uv_index:
                     raise Exception("No UV data")
                 m = meshes[uv_index]

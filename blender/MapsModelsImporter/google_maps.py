@@ -189,6 +189,32 @@ def mergeConstantBlocks(constants):
         merged.update(block)
     return merged
 
+def pickPlacementMatrix(names):
+    """Pick the per-tile placement matrix from the candidate constants.
+
+    Only the matrix that positions each tile in the world varies from draw
+    call to draw call; a projection matrix is shared by every tile, so picking
+    it collapses the whole scene into a single pile (the reference-matrix step
+    in extractUniforms cancels a shared matrix to the identity). Prefer, in
+    order: an explicit mesh/model-to-world matrix, a modelview that is not
+    premultiplied by the projection, any non-projection matrix, and only fall
+    back to the first candidate if nothing else fits.
+    """
+    lowered = [(n, n.lower()) for n in names]
+    for n, low in lowered:
+        if "meshtoworld" in low or "modeltoworld" in low:
+            return n
+    for n, low in lowered:
+        if "modelview" in low and "proj" not in low:
+            return n
+    for n, low in lowered:
+        if "model" in low and "proj" not in low:
+            return n
+    for n, low in lowered:
+        if "proj" not in low:
+            return n
+    return names[0]
+
 def resolveUniformsFromHints(globUniforms, hints, uvs):
     """Work out which constant is the model matrix and which is the UV
     transform, when their names mean nothing to us.
@@ -203,7 +229,47 @@ def resolveUniformsFromHints(globUniforms, hints, uvs):
     if not matrix_candidates or not uv_candidates:
         return None, None
 
-    matrix = makeMatrix(globUniforms[matrix_candidates[0]])
+    matrix_name = pickPlacementMatrix(matrix_candidates)
+    matrix = makeMatrix(globUniforms[matrix_name])
+    # A mesh-to-world matrix places the tile in world space. Its bottom row is
+    # not a transform at all: the shader replaces that row with (0, 0, 0, 1)
+    # and reads only its last element, as a cull bitmask (see vertexLodMask).
+    # Letting it through would shear every tile.
+    if "meshtoworld" in matrix_name.lower() or "modeltoworld" in matrix_name.lower():
+        matrix[3] = [0, 0, 0, 1]
+
+    # A '...TexCoordScaleBias' constant is laid out [scale_u, scale_v, bias_u,
+    # bias_v] and applies straight to an already-normalised UV attribute. That
+    # is the opposite order from the [offset, offset, scale, scale] pairs the
+    # scoring heuristic below assumes, so the heuristic can never recognise it
+    # and falls through to whatever vec4 happens to tie first.
+    for name in uv_candidates:
+        if "texcoordscalebias" not in name.lower():
+            continue
+        value = globUniforms[name]
+        if len(value) < 4:
+            continue
+        scale_u, scale_v, bias_u, bias_v = (float(v) for v in value[:4])
+        if scale_u == 0.0 or scale_v == 0.0:
+            continue
+        # The importer applies (uv * 65535 + 0.5 + o) * s, so fold the
+        # scale/bias pair into that form:
+        #     u_out = u * scale_u + bias_u    with su = scale_u / 65535
+        #                                     and  ou = bias_u / su - 0.5
+        # V needs flipping on top of that. The shader samples the texture with
+        # v = 0 at the top row, which is how RenderDoc writes the png too, but
+        # Blender puts v = 0 at the bottom. So solve the same form for
+        #     v_out = 1 - (v * scale_v + bias_v)
+        # which gives a negative scale and a large offset. Measured against
+        # Google's own framebuffer: reading V this way reproduces its pixels to
+        # 1.2/255 once blurred, leaving it unflipped is 20.6/255 off.
+        su = scale_u / 65535.0
+        sv = -scale_v / 65535.0
+        ou = bias_u / su - 0.5
+        ov = (1.0 - bias_v) / sv - 0.5
+        print(f"Using '{matrix_name}' as the model matrix and '{name}' "
+              f"(scale/bias) as the UV transform")
+        return [ou, ov, su, sv], matrix
 
     best = None
     for name in uv_candidates:
@@ -224,9 +290,43 @@ def resolveUniformsFromHints(globUniforms, hints, uvs):
         return None, None
 
     score, offsetScale, name, convention = best
-    print(f"Using '{matrix_candidates[0]}' as the model matrix and '{name}' "
+    print(f"Using '{matrix_name}' as the model matrix and '{name}' "
           f"({convention}) as the UV transform")
     return offsetScale, matrix
+
+def vertexLodMask(positions, constants):
+    """Which vertices the shader actually draws.
+
+    A tile covers one node of an octree, and the fourth position byte tags
+    each vertex with the child it belongs to: exactly a power of two, 1 to
+    128. The last element of the mesh-to-world matrix is a bitmask of the
+    children this tile is responsible for, the neighbouring finer tiles
+    covering the rest. From the disassembly:
+
+        t    = _uuMeshToWorldMatrix[3].w / (2 * position.w)
+        mask = floor(frac(t) * 2)
+
+    and the clip position is multiplied by that bit, so a cleared one lands
+    the vertex on the origin and degenerates its triangles away.
+
+    On the captures seen so far Google only ever uploads the children the
+    mask keeps, so this culls nothing. It is here because the shader does it,
+    and a capture where it matters would otherwise stitch unrelated parts of
+    a tile together.
+    """
+    if positions is None or positions.ndim != 2 or positions.shape[1] < 4:
+        return None
+    globUniforms = mergeConstantBlocks(constants)
+    meshToWorld = globUniforms.get('_uuMeshToWorldMatrix')
+    if meshToWorld is None or len(meshToWorld) < 16:
+        return None
+
+    level = float(meshToWorld[15])
+    w = np.asarray(positions[:, 3], dtype=np.float64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = level / (2.0 * w)
+    t = np.where(np.isfinite(t), t, 0.0)
+    return np.floor((t - np.floor(t)) * 2.0) >= 1.0
 
 def uvConvention(value, convention):
     """The two ways the UV offset/scale vec4 has been seen to be laid out."""
@@ -474,7 +574,23 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
             continue
 
         if constants["DrawCall"]["type"] == 'Google Maps':
-            verts = positions[:,:3] * 256.0 # [ [ p[0] * 256.0, p[1] * 256.0, p[2] * 256.0 ] for p in positions ]
+            # The classic shader stores normalised positions, which the model
+            # matrix expects scaled up by 256. The current "draped" one stores
+            # raw 8-bit values that are already in the matrix's units; scaling
+            # those again makes every tile ~256x too large for the spacing
+            # between tiles, so they overlap into a heap instead of tiling.
+            raw_positions = positions[:,:3]
+            if float(np.abs(raw_positions).max()) <= 1.5:
+                verts = raw_positions * 256.0
+            else:
+                verts = raw_positions
+
+            lod_mask = vertexLodMask(positions, constants)
+            if lod_mask is not None and len(tris) > 0:
+                tris = tris[lod_mask[tris].all(axis=1)]
+                if len(tris) == 0:
+                    drawcall_id += 1
+                    continue
         elif constants["DrawCall"]["type"] == 'Mapy CZ':
             raw_verts = positions[:,:3]
             verts = []
